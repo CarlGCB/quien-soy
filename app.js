@@ -1,46 +1,147 @@
 /**
  * ════════════════════════════════════════════════════════════════
- *  ¿QUIÉN SOY? — app.js  (Modo LOCAL)
+ *  ¿QUIÉN SOY? — app.js  (Modo ONLINE con Supabase)
  *
- *  Multijugador local: varias pestañas del mismo navegador
- *  comparten estado vía localStorage + BroadcastChannel.
+ *  Backend: Supabase Realtime + REST API
+ *  Funciona entre dispositivos de distintas redes.
  * ════════════════════════════════════════════════════════════════
  */
 
 'use strict';
 
 /* ══════════════════════════════════════════════════════════════
-   BANCO DE IMÁGENES
+   CONFIGURACIÓN SUPABASE
+   ══════════════════════════════════════════════════════════════ */
+var SUPABASE_URL = 'https://wvgycpvdpiutzaxvoxcq.supabase.co';
+var SUPABASE_KEY = 'sb_publishable_2V_etQHsoX0SQt57PqtoSw_yse3xZn1';
+
+/* ── Cabeceras para todas las peticiones REST ──────────────── */
+var SB_HEADERS = {
+  'Content-Type':  'application/json',
+  'apikey':        SUPABASE_KEY,
+  'Authorization': 'Bearer ' + SUPABASE_KEY,
+  'Prefer':        'return=representation'
+};
+
+/* ── Leer sala desde Supabase ──────────────────────────────── */
+function readRoom(code) {
+  return fetch(SUPABASE_URL + '/rest/v1/rooms?code=eq.' + code + '&select=data', {
+    headers: SB_HEADERS
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(rows) { return rows.length ? rows[0].data : null; })
+  .catch(function() { return null; });
+}
+
+/* ── Escribir / actualizar sala en Supabase ─────────────────── */
+function writeRoom(code, room) {
+  return fetch(SUPABASE_URL + '/rest/v1/rooms', {
+    method:  'POST',
+    headers: Object.assign({}, SB_HEADERS, { 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+    body:    JSON.stringify({ code: code, data: room, updated_at: new Date().toISOString() })
+  }).catch(function(e) { console.error('writeRoom error:', e); });
+}
+
+/* ── Borrar sala de Supabase ─────────────────────────────────── */
+function deleteRoom(code) {
+  return fetch(SUPABASE_URL + '/rest/v1/rooms?code=eq.' + code, {
+    method:  'DELETE',
+    headers: SB_HEADERS
+  }).catch(function(e) { console.error('deleteRoom error:', e); });
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SUPABASE REALTIME — escucha cambios en tiempo real
    ══════════════════════════════════════════════════════════════
+ *  Supabase Realtime usa WebSockets para notificar cambios en
+ *  la tabla. Cuando cualquier jugador escribe en la sala,
+ *  todos los demás reciben el evento al instante.
  *
- *  ✏️  PARA AÑADIR MÁS IMÁGENES:
- *  1. Pon el archivo .jpg/.png en la carpeta correspondiente.
- *  2. Añade una línea aquí con el nombre visible y la ruta.
- *  Ejemplo:
- *    { name: 'Nuevo Animal', url: 'img/animales/nuevo-animal.jpg' },
- * ══════════════════════════════════════════════════════════════ */
+ *  Protocolo: WebSocket con mensajes JSON tipo Phoenix.
+ */
+var _realtimeWs   = null;
+var _realtimeCode = null;
+var _heartbeatInterval = null;
+var _realtimeRef  = 1;
 
+function openRealtime(code, onUpdate, onDelete) {
+  closeRealtime();
+  _realtimeCode = code;
+
+  var wsUrl = SUPABASE_URL.replace('https://', 'wss://') +
+              '/realtime/v1/websocket?apikey=' + SUPABASE_KEY + '&vsn=1.0.0';
+
+  _realtimeWs = new WebSocket(wsUrl);
+
+  _realtimeWs.onopen = function() {
+    // 1. Unirse al canal de la tabla rooms filtrado por code
+    _realtimeWs.send(JSON.stringify({
+      topic:   'realtime:public:rooms:code=eq.' + code,
+      event:   'phx_join',
+      payload: { config: { broadcast: { self: false }, presence: {}, postgres_changes: [
+        { event: '*', schema: 'public', table: 'rooms', filter: 'code=eq.' + code }
+      ]}},
+      ref:     String(_realtimeRef++)
+    }));
+
+    // 2. Heartbeat cada 25 s para mantener la conexión viva
+    _heartbeatInterval = setInterval(function() {
+      if (_realtimeWs && _realtimeWs.readyState === WebSocket.OPEN) {
+        _realtimeWs.send(JSON.stringify({
+          topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(_realtimeRef++)
+        }));
+      }
+    }, 25000);
+  };
+
+  _realtimeWs.onmessage = function(e) {
+    try {
+      var msg = JSON.parse(e.data);
+      if (!msg.payload || !msg.payload.data) return;
+
+      var eventType = msg.payload.data.type; // INSERT, UPDATE, DELETE
+      if (eventType === 'DELETE') {
+        onDelete();
+      } else if (eventType === 'INSERT' || eventType === 'UPDATE') {
+        var newData = msg.payload.data.record && msg.payload.data.record.data;
+        if (newData) onUpdate(newData);
+      }
+    } catch (err) { /* ignorar mensajes que no son de datos */ }
+  };
+
+  _realtimeWs.onclose = function() {
+    clearInterval(_heartbeatInterval);
+    // Reconectar tras 3 s si la sala sigue activa
+    if (_realtimeCode === code) {
+      setTimeout(function() {
+        if (_realtimeCode === code) openRealtime(code, onUpdate, onDelete);
+      }, 3000);
+    }
+  };
+
+  _realtimeWs.onerror = function() { _realtimeWs.close(); };
+}
+
+function closeRealtime() {
+  _realtimeCode = null;
+  clearInterval(_heartbeatInterval);
+  if (_realtimeWs) { _realtimeWs.close(); _realtimeWs = null; }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   BANCO DE IMÁGENES
+   ══════════════════════════════════════════════════════════════ */
 var IMAGE_BANK = {
-
-  /* ── ACTORES → carpeta img/actores/ ───────────────────────── */
   actors: [
     { name: 'Dwayne Johnson', url: 'img/actores/dwayne-johnson.jpg' },
     { name: 'Johnny Depp',    url: 'img/actores/johnny-depp.jpg'    },
     { name: 'Will Smith',     url: 'img/actores/wiil-smith.jpg'     },
-    // ↓ Añade más actores aquí
-    // { name: 'Nombre Apellido', url: 'img/actores/nombre-apellido.jpg' },
   ],
-
-  /* ── PELÍCULAS → carpeta img/peliculas/ ───────────────────── */
   movies: [
-    { name: 'Crepúsculo',        url: 'img/peliculas/creepusculo.jpg'        },
+    { name: 'Crepúsculo',         url: 'img/peliculas/creepusculo.jpg'        },
     { name: 'Piratas del Caribe', url: 'img/peliculas/piratas-del-caribe.jpg' },
     { name: 'Titanic',            url: 'img/peliculas/titanic.jpg'             },
-    // ↓ Añade más películas aquí
-    // { name: 'Nombre Película', url: 'img/peliculas/nombre-pelicula.jpg' },
   ],
-
-  /* ── ANIMALES → carpeta img/animales/ ────────────────────── */
   animals: [
     { name: 'Capybara', url: 'img/animales/capybara.jpg' },
     { name: 'Gato',     url: 'img/animales/gato.jpg'     },
@@ -50,17 +151,11 @@ var IMAGE_BANK = {
     { name: 'Pollito',  url: 'img/animales/pollito.jpg'  },
     { name: 'Tiburón',  url: 'img/animales/tiburon.jpg'  },
     { name: 'Tucán',    url: 'img/animales/tucan.jpg'    },
-    // ↓ Añade más animales aquí
-    // { name: 'Nombre Animal', url: 'img/animales/nombre-animal.jpg' },
   ]
 };
 
-/* loadImageBank es un stub — sin fetch, sin servidor necesario */
-var IMAGE_BANK_LOADED = true;
-function loadImageBank(callback) { callback(); }
-
 /* ══════════════════════════════════════════════════════════════
-   ESTADO LOCAL DE ESTA PESTAÑA/JUGADOR
+   ESTADO LOCAL
    ══════════════════════════════════════════════════════════════ */
 var myState = {
   roomCode:   null,
@@ -72,80 +167,12 @@ var myState = {
 };
 
 /* ══════════════════════════════════════════════════════════════
-   PERSISTENCIA: localStorage + BroadcastChannel
-   ══════════════════════════════════════════════════════════════ */
-
-function ROOM_KEY(code) { return 'quien_soy_room_' + code; }
-
-function readRoom(code) {
-  try {
-    var raw = localStorage.getItem(ROOM_KEY(code));
-    return raw ? JSON.parse(raw) : null;
-  } catch (e) { return null; }
-}
-
-function writeRoom(code, room) {
-  localStorage.setItem(ROOM_KEY(code), JSON.stringify(room));
-  if (window._bc) window._bc.postMessage({ type: 'room_updated', code: code });
-}
-
-function deleteRoom(code) {
-  localStorage.removeItem(ROOM_KEY(code));
-  if (window._bc) window._bc.postMessage({ type: 'room_deleted', code: code });
-}
-
-function openBroadcastChannel(code) {
-  closeBroadcastChannel();
-  if (typeof BroadcastChannel !== 'undefined') {
-    window._bc = new BroadcastChannel('quien_soy');
-    window._bc.onmessage = function(e) {
-      if (e.data.code !== code) return;
-      if (e.data.type === 'room_deleted') { handleRoomGone(); return; }
-      if (e.data.type === 'room_updated') { handleRoomUpdated(); }
-    };
-  }
-}
-
-function closeBroadcastChannel() {
-  if (window._bc) { window._bc.close(); window._bc = null; }
-}
-
-function handleRoomUpdated() {
-  var room = readRoom(myState.roomCode);
-  if (!room) { handleRoomGone(); return; }
-
-  var currentScreen = document.querySelector('.screen.active');
-  var screenId = currentScreen ? currentScreen.id : '';
-
-  if (room.status === 'lobby' && screenId === 'screen-lobby') {
-    renderLobbyPlayers(room);
-  } else if (room.status === 'playing') {
-    if (screenId !== 'screen-game') {
-      enterGame(room);
-    } else {
-      renderArena(room);
-      renderRoundVotes(room);
-    }
-  }
-}
-
-function handleRoomGone() {
-  closeBroadcastChannel();
-  window.removeEventListener('storage', onStorageChange);
-  showScreen('screen-home');
-  showToast('La sala fue cerrada');
-}
-
-/* ══════════════════════════════════════════════════════════════
    UTILIDADES UI
    ══════════════════════════════════════════════════════════════ */
-
 function generateRoomCode() {
   var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   var code = '';
-  for (var i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
+  for (var i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return code;
 }
 
@@ -170,20 +197,26 @@ function showToast(msg, duration) {
   toastTimer = setTimeout(function() { t.classList.add('hidden'); }, duration);
 }
 
+function showOverlay(msg) {
+  document.getElementById('overlay-msg').textContent = msg || 'Cargando…';
+  document.getElementById('overlay').classList.remove('hidden');
+}
+function hideOverlay() {
+  document.getElementById('overlay').classList.add('hidden');
+}
+
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
   var target = document.getElementById(id);
   if (target) {
     requestAnimationFrame(function() {
-      requestAnimationFrame(function() {
-        target.classList.add('active');
-      });
+      requestAnimationFrame(function() { target.classList.add('active'); });
     });
   }
 }
 
 /* ══════════════════════════════════════════════════════════════
-   DERANGEMENT — Reparto Modo Libre
+   DERANGEMENT — Modo Libre
    ══════════════════════════════════════════════════════════════ */
 function buildDerangement(n) {
   if (n < 2) return [0];
@@ -211,12 +244,8 @@ function assignFreeImages(players) {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   COLA ALEATORIA DE IMÁGENES (Shuffled Queue)
-   ══════════════════════════════════════════════════════════════
- *  Todas las imágenes pasan una vez antes de repetirse.
- *  La cola se guarda en la sala para que todas las pestañas
- *  estén sincronizadas.
- */
+   COLA ALEATORIA DE IMÁGENES
+   ══════════════════════════════════════════════════════════════ */
 function shuffle(arr) {
   var a = arr.slice();
   for (var i = a.length - 1; i > 0; i--) {
@@ -229,10 +258,8 @@ function shuffle(arr) {
 function drawFromQueue(queue, bank, n) {
   var bankUrls = bank.map(function(img) { return img.url; });
   queue = queue ? queue.slice() : [];
-
   if (queue.length < n) {
     var fresh = shuffle(bankUrls);
-    // Evitar que la primera del nuevo ciclo coincida con la última del anterior
     if (queue.length > 0 && fresh.length > 1) {
       var lastUsed = queue[queue.length - 1];
       if (fresh[0] === lastUsed) {
@@ -242,29 +269,47 @@ function drawFromQueue(queue, bank, n) {
     }
     queue = queue.concat(fresh);
   }
-
-  var picked    = queue.slice(0, n);
-  var remaining = queue.slice(n);
-  return { picked: picked, remaining: remaining };
+  return { picked: queue.slice(0, n), remaining: queue.slice(n) };
 }
 
 function assignCategoryImages(players, category, currentQueue) {
   var bank = IMAGE_BANK[category];
   var ids  = Object.keys(players);
-  var n    = ids.length;
-
   if (!bank || bank.length === 0) return { assignments: {}, queue: [] };
-
-  var drawn = drawFromQueue(currentQueue, bank, n);
+  var drawn = drawFromQueue(currentQueue, bank, ids.length);
   var assignments = {};
   ids.forEach(function(id, i) { assignments[id] = drawn.picked[i]; });
   return { assignments: assignments, queue: drawn.remaining };
 }
 
 /* ══════════════════════════════════════════════════════════════
+   REACCIONAR A CAMBIOS RECIBIDOS POR REALTIME
+   ══════════════════════════════════════════════════════════════ */
+function onRoomUpdated(room) {
+  var currentScreen = document.querySelector('.screen.active');
+  var screenId = currentScreen ? currentScreen.id : '';
+
+  if (room.status === 'lobby' && screenId === 'screen-lobby') {
+    renderLobbyPlayers(room);
+  } else if (room.status === 'playing') {
+    if (screenId !== 'screen-game') {
+      enterGame(room);
+    } else {
+      renderArena(room);
+      renderRoundVotes(room);
+    }
+  }
+}
+
+function onRoomDeleted() {
+  closeRealtime();
+  showScreen('screen-home');
+  showToast('La sala fue cerrada');
+}
+
+/* ══════════════════════════════════════════════════════════════
    ACCIONES PRINCIPALES
    ══════════════════════════════════════════════════════════════ */
-
 function createRoom() {
   var name = document.getElementById('create-name').value.trim();
   if (!name) { showToast('⚠️ Escribe tu nombre'); return; }
@@ -274,14 +319,12 @@ function createRoom() {
   var freeUrl     = document.getElementById('create-free-url').value.trim();
   var freeDataUrl = window._createFreeDataUrl || null;
   if (freeDataUrl) freeUrl = freeDataUrl;
+  if (mode === 'free' && !freeUrl) { showToast('⚠️ Añade una URL o sube una imagen'); return; }
 
-  if (mode === 'free' && !freeUrl) {
-    showToast('⚠️ Añade una URL o sube una imagen'); return;
-  }
+  showOverlay('Creando sala…');
 
   var code     = generateRoomCode();
   var playerId = generatePlayerId();
-
   myState.roomCode   = code;
   myState.playerId   = playerId;
   myState.playerName = name;
@@ -290,17 +333,14 @@ function createRoom() {
   var players = {};
   players[playerId] = { name: name, freeUrl: freeUrl || null, assignedImage: null };
 
-  var room = {
-    host:     playerId,
-    mode:     mode,
-    category: mode === 'category' ? category : null,
-    status:   'lobby',
-    players:  players
-  };
+  var room = { host: playerId, mode: mode, category: mode === 'category' ? category : null,
+               status: 'lobby', players: players };
 
-  writeRoom(code, room);
-  openBroadcastChannel(code);
-  enterLobby(room);
+  writeRoom(code, room).then(function() {
+    hideOverlay();
+    openRealtime(code, onRoomUpdated, onRoomDeleted);
+    enterLobby(room);
+  });
 }
 
 function joinRoom() {
@@ -313,25 +353,28 @@ function joinRoom() {
   if (!name) { showToast('⚠️ Escribe tu nombre'); return; }
   if (code.length !== 6) { showToast('⚠️ El código tiene 6 caracteres'); return; }
 
-  var room = readRoom(code);
-  if (!room) { showToast('❌ Sala no encontrada'); return; }
-  if (room.status === 'playing') { showToast('🎮 El juego ya empezó'); return; }
-  if (room.mode === 'free' && !freeUrl) {
-    showToast('⚠️ Añade una URL o sube una imagen'); return;
-  }
+  showOverlay('Buscando sala…');
 
-  var playerId = generatePlayerId();
-  myState.roomCode   = code;
-  myState.playerId   = playerId;
-  myState.playerName = name;
-  myState.isHost     = false;
-  myState.gameMode   = room.mode;
+  readRoom(code).then(function(room) {
+    if (!room) { hideOverlay(); showToast('❌ Sala no encontrada'); return; }
+    if (room.status === 'playing') { hideOverlay(); showToast('🎮 El juego ya empezó'); return; }
+    if (room.mode === 'free' && !freeUrl) { hideOverlay(); showToast('⚠️ Añade una URL o sube una imagen'); return; }
 
-  room.players[playerId] = { name: name, freeUrl: freeUrl || null, assignedImage: null };
-  writeRoom(code, room);
+    var playerId = generatePlayerId();
+    myState.roomCode   = code;
+    myState.playerId   = playerId;
+    myState.playerName = name;
+    myState.isHost     = false;
+    myState.gameMode   = room.mode;
 
-  openBroadcastChannel(code);
-  enterLobby(room);
+    room.players[playerId] = { name: name, freeUrl: freeUrl || null, assignedImage: null };
+
+    writeRoom(code, room).then(function() {
+      hideOverlay();
+      openRealtime(code, onRoomUpdated, onRoomDeleted);
+      enterLobby(room);
+    });
+  });
 }
 
 /* ── LOBBY ──────────────────────────────────────────────────── */
@@ -340,12 +383,6 @@ function enterLobby(room) {
   document.getElementById('btn-start-game').classList.toggle('hidden', !myState.isHost);
   showScreen('screen-lobby');
   renderLobbyPlayers(room);
-  window.addEventListener('storage', onStorageChange);
-}
-
-function onStorageChange(e) {
-  if (!myState.roomCode) return;
-  if (e.key === ROOM_KEY(myState.roomCode)) handleRoomUpdated();
 }
 
 function renderLobbyPlayers(room) {
@@ -354,7 +391,6 @@ function renderLobbyPlayers(room) {
 
   document.getElementById('lobby-waiting').textContent =
     count < 2 ? 'Esperando jugadores… (mínimo 2)' : count + ' jugadores listos ✓';
-
   document.getElementById('btn-start-game').disabled = (count < 2);
 
   var container = document.getElementById('lobby-players');
@@ -373,49 +409,39 @@ function renderLobbyPlayers(room) {
 
 /* ── INICIAR JUEGO (solo host) ─────────────────────────────── */
 function hostStartGame() {
-  var room = readRoom(myState.roomCode);
-  if (!room) return;
-
-  var count = Object.keys(room.players || {}).length;
-  if (count < 2) { showToast('⚠️ Necesitas al menos 2 jugadores'); return; }
-
-  _doStartGame(room);
+  readRoom(myState.roomCode).then(function(room) {
+    if (!room) return;
+    var count = Object.keys(room.players || {}).length;
+    if (count < 2) { showToast('⚠️ Necesitas al menos 2 jugadores'); return; }
+    _doStartGame(room);
+  });
 }
 
 function _doStartGame(room) {
   if (room.mode !== 'free') {
     var bank = IMAGE_BANK[room.category] || [];
-    if (bank.length === 0) {
-      showToast('⚠️ No hay imágenes en esta categoría');
-      return;
-    }
+    if (bank.length === 0) { showToast('⚠️ No hay imágenes en esta categoría'); return; }
   }
 
   if (room.mode === 'free') {
     var assignments = assignFreeImages(room.players);
-    Object.entries(assignments).forEach(function(entry) {
-      room.players[entry[0]].assignedImage = entry[1];
-    });
+    Object.entries(assignments).forEach(function(e) { room.players[e[0]].assignedImage = e[1]; });
   } else {
     var result = assignCategoryImages(room.players, room.category, room.imageQueue || null);
-    Object.entries(result.assignments).forEach(function(entry) {
-      room.players[entry[0]].assignedImage = entry[1];
-    });
+    Object.entries(result.assignments).forEach(function(e) { room.players[e[0]].assignedImage = e[1]; });
     room.imageQueue = result.queue;
   }
 
   room.status = 'playing';
-  writeRoom(myState.roomCode, room);
-  enterGame(room);
+  showOverlay('Iniciando…');
+  writeRoom(myState.roomCode, room).then(function() {
+    hideOverlay();
+    enterGame(room); // el host entra directamente; los demás lo detectan por Realtime
+  });
 }
 
 /* ── JUEGO ──────────────────────────────────────────────────── */
-var CATEGORY_LABELS = {
-  actors:  '🎬 Actores',
-  movies:  '🎞 Películas',
-  animals: '🐾 Animales',
-  free:    '🖼 Modo Libre'
-};
+var CATEGORY_LABELS = { actors: '🎬 Actores', movies: '🎞 Películas', animals: '🐾 Animales', free: '🖼 Modo Libre' };
 
 function enterGame(room) {
   document.getElementById('my-player-name').textContent = myState.playerName;
@@ -427,72 +453,19 @@ function enterGame(room) {
   renderRoundVotes(room);
 }
 
-/* ══════════════════════════════════════════════════════════════
-   POSICIONES DE JUGADORES SEGÚN NÚMERO
-   ══════════════════════════════════════════════════════════════
- *
- *  Cada layout devuelve un array de {x, y} en porcentaje (0-1)
- *  relativo al tamaño del área de juego.
- *
- *  2 jugadores → horizontal (izquierda / derecha)
- *  3 jugadores → triángulo  (1 arriba, 2 abajo)
- *  4 jugadores → rombo      (arriba, izquierda, derecha, abajo)
- *  5+ jugadores → círculo   (puntos equidistantes en circunferencia)
- *
- *  Coordenadas: x=0 izquierda, x=1 derecha, y=0 arriba, y=1 abajo.
- *  El centro es (0.5, 0.5).
- */
+/* ── Posiciones por número de jugadores ─────────────────────── */
 function getPlayerPositions(n) {
-  if (n === 2) {
-    return [
-      { x: 0.25, y: 0.5 },   // izquierda
-      { x: 0.75, y: 0.5 }    // derecha
-    ];
-  }
-
-  if (n === 3) {
-    return [
-      { x: 0.5,  y: 0.15 },  // arriba-centro
-      { x: 0.18, y: 0.75 },  // abajo-izquierda
-      { x: 0.82, y: 0.75 }   // abajo-derecha
-    ];
-  }
-
-  if (n === 4) {
-    return [
-      { x: 0.5,  y: 0.08 },  // arriba
-      { x: 0.08, y: 0.5  },  // izquierda
-      { x: 0.92, y: 0.5  },  // derecha
-      { x: 0.5,  y: 0.88 }   // abajo
-    ];
-  }
-
-  /* 5+ jugadores: círculo
-   * Ángulo inicial -90° (arriba), giro horario.
-   * Radio = 0.36 (en fracción del ancho/alto del área).
-   */
-  var positions = [];
-  var cx = 0.5, cy = 0.5;
-  var R  = 0.36;
-  var offset = -Math.PI / 2; // empieza arriba
+  if (n === 2) return [{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }];
+  if (n === 3) return [{ x: 0.5, y: 0.15 }, { x: 0.18, y: 0.75 }, { x: 0.82, y: 0.75 }];
+  if (n === 4) return [{ x: 0.5, y: 0.08 }, { x: 0.08, y: 0.5 }, { x: 0.92, y: 0.5 }, { x: 0.5, y: 0.88 }];
+  var pos = [], cx = 0.5, cy = 0.5, R = 0.36, off = -Math.PI / 2;
   for (var i = 0; i < n; i++) {
-    var angle = offset + (2 * Math.PI / n) * i;
-    positions.push({
-      x: cx + R * Math.cos(angle),
-      y: cy + R * Math.sin(angle)
-    });
+    var a = off + (2 * Math.PI / n) * i;
+    pos.push({ x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) });
   }
-  return positions;
+  return pos;
 }
 
-/* ── renderArena ─────────────────────────────────────────────────
- *  REGLA DE VISIBILIDAD:
- *  • Mi tarjeta  → muestra "?" (yo no puedo ver mi imagen)
- *  • Las demás   → muestra la imagen asignada + lupa para ampliar
- *
- *  Las posiciones {x, y} se convierten a píxeles usando el tamaño
- *  real del contenedor en el momento del render.
- */
 function renderArena(room) {
   var players = room.players || {};
   var arena   = document.getElementById('game-arena');
@@ -503,122 +476,97 @@ function renderArena(room) {
   var n   = ids.length;
   if (n === 0) return;
 
-  var W = arena.clientWidth  || window.innerWidth;
-  var H = arena.clientHeight || Math.max(280, window.innerHeight - 220);
-
-  var positions = getPlayerPositions(n);
+  var W   = arena.clientWidth  || window.innerWidth;
+  var H   = arena.clientHeight || Math.max(280, window.innerHeight - 220);
+  var pos = getPlayerPositions(n);
 
   ids.forEach(function(id, i) {
-    var p    = players[id];
-    var isMe = (id === myState.playerId);
-    var pos  = positions[i];
-
+    var p = players[id], isMe = (id === myState.playerId);
     var card = document.createElement('div');
     card.className = 'player-card' + (isMe ? ' is-me' : '');
-    card.style.left = (pos.x * W) + 'px';
-    card.style.top  = (pos.y * H) + 'px';
+    card.style.left = (pos[i].x * W) + 'px';
+    card.style.top  = (pos[i].y * H) + 'px';
 
     var imgHtml;
     if (isMe) {
       imgHtml = '<div class="player-image-wrap hidden-card" title="Esta es tu imagen"></div>';
     } else if (p.assignedImage) {
-      imgHtml =
-        '<div class="player-image-wrap clickable-img"' +
-             ' data-src="' + p.assignedImage + '"' +
-             ' data-name="' + p.name + '" title="Toca para ampliar">' +
-          '<img src="' + p.assignedImage + '" alt="' + p.name + '" loading="lazy"' +
-               ' onerror="this.src=\'https://placehold.co/90x90/1c1c2e/00f5ff?text=?\'" />' +
-          '<div class="img-zoom-hint">🔍</div>' +
-        '</div>';
+      imgHtml = '<div class="player-image-wrap clickable-img" data-src="' + p.assignedImage +
+                '" data-name="' + p.name + '" title="Toca para ampliar">' +
+                '<img src="' + p.assignedImage + '" alt="' + p.name + '" loading="lazy"' +
+                ' onerror="this.src=\'https://placehold.co/90x90/1c1c2e/00f5ff?text=?\'" />' +
+                '<div class="img-zoom-hint">🔍</div></div>';
     } else {
       imgHtml = '<div class="player-image-wrap hidden-card"></div>';
     }
 
-    card.innerHTML =
-      (isMe ? '<div class="me-badge">YO</div>' : '') +
-      imgHtml +
-      '<div class="player-card-name">' + p.name + '</div>';
-
+    card.innerHTML = (isMe ? '<div class="me-badge">YO</div>' : '') + imgHtml +
+                     '<div class="player-card-name">' + p.name + '</div>';
     arena.appendChild(card);
   });
 
-  // Click para abrir lightbox
   arena.querySelectorAll('.clickable-img').forEach(function(wrap) {
-    wrap.addEventListener('click', function() {
-      openLightbox(wrap.dataset.src, wrap.dataset.name);
-    });
+    wrap.addEventListener('click', function() { openLightbox(wrap.dataset.src, wrap.dataset.name); });
   });
 }
 
-// Re-calcular si la ventana cambia de tamaño (rotación móvil, resize)
 window.addEventListener('resize', function() {
   var active = document.querySelector('.screen.active');
   if (active && active.id === 'screen-game' && myState.roomCode) {
-    var room = readRoom(myState.roomCode);
-    if (room) renderArena(room);
+    readRoom(myState.roomCode).then(function(room) { if (room) renderArena(room); });
   }
 });
 
 /* ── LIGHTBOX ──────────────────────────────────────────────── */
 function openLightbox(src, name) {
-  var lb     = document.getElementById('lightbox');
-  var lbImg  = document.getElementById('lightbox-img');
-  var lbName = document.getElementById('lightbox-name');
-  lbImg.src          = src;
-  lbImg.alt          = name;
-  lbName.textContent = name;
+  var lb = document.getElementById('lightbox');
+  document.getElementById('lightbox-img').src = src;
+  document.getElementById('lightbox-img').alt = name;
+  document.getElementById('lightbox-name').textContent = name;
   lb.classList.remove('hidden');
   requestAnimationFrame(function() { lb.classList.add('open'); });
 }
-
 function closeLightbox() {
   var lb = document.getElementById('lightbox');
   lb.classList.remove('open');
   setTimeout(function() { lb.classList.add('hidden'); }, 250);
 }
 
-/* ── NUEVA RONDA — sistema de votos ─────────────────────────── *
- *  Todos pulsan "Nueva Ronda". Cuando el último vota, se reparte *
- *  automáticamente una nueva ronda y se limpian los votos.       */
+/* ── NUEVA RONDA — votos ─────────────────────────────────────── */
 function voteNewRound() {
-  var room = readRoom(myState.roomCode);
-  if (!room) return;
+  readRoom(myState.roomCode).then(function(room) {
+    if (!room) return;
+    if (!room.roundVotes) room.roundVotes = {};
+    room.roundVotes[myState.playerId] = true;
 
-  if (!room.roundVotes) room.roundVotes = {};
-  room.roundVotes[myState.playerId] = true;
+    var totalPlayers = Object.keys(room.players).length;
+    var totalVotes   = Object.keys(room.roundVotes).length;
 
-  var totalPlayers = Object.keys(room.players).length;
-  var totalVotes   = Object.keys(room.roundVotes).length;
+    if (totalVotes >= totalPlayers) {
+      Object.keys(room.players).forEach(function(pid) { room.players[pid].assignedImage = null; });
 
-  if (totalVotes >= totalPlayers) {
-    Object.keys(room.players).forEach(function(pid) {
-      room.players[pid].assignedImage = null;
-    });
+      if (room.mode === 'free') {
+        var assignments = assignFreeImages(room.players);
+        Object.entries(assignments).forEach(function(e) { room.players[e[0]].assignedImage = e[1]; });
+      } else {
+        var result = assignCategoryImages(room.players, room.category, room.imageQueue || null);
+        Object.entries(result.assignments).forEach(function(e) { room.players[e[0]].assignedImage = e[1]; });
+        room.imageQueue = result.queue;
+      }
 
-    if (room.mode === 'free') {
-      var assignments = assignFreeImages(room.players);
-      Object.entries(assignments).forEach(function(entry) {
-        room.players[entry[0]].assignedImage = entry[1];
+      room.roundVotes = {};
+      writeRoom(myState.roomCode, room).then(function() {
+        renderArena(room);
+        renderRoundVotes(room);
+        showToast('🔄 ¡Nueva ronda!');
       });
     } else {
-      var result = assignCategoryImages(room.players, room.category, room.imageQueue || null);
-      Object.entries(result.assignments).forEach(function(entry) {
-        room.players[entry[0]].assignedImage = entry[1];
+      writeRoom(myState.roomCode, room).then(function() {
+        renderRoundVotes(room);
+        showToast('✅ Voto registrado (' + totalVotes + '/' + totalPlayers + ')');
       });
-      room.imageQueue = result.queue;
     }
-
-    room.roundVotes = {};
-    writeRoom(myState.roomCode, room);
-    // El votante final no recibe su propio broadcast → actualizamos manualmente
-    renderArena(room);
-    renderRoundVotes(room);
-    showToast('🔄 ¡Nueva ronda!');
-  } else {
-    writeRoom(myState.roomCode, room);
-    renderRoundVotes(room);
-    showToast('✅ Voto registrado (' + totalVotes + '/' + totalPlayers + ')');
-  }
+  });
 }
 
 function renderRoundVotes(room) {
@@ -626,45 +574,55 @@ function renderRoundVotes(room) {
   var total  = Object.keys(room.players).length;
   var count  = Object.keys(votes).length;
   var iVoted = !!votes[myState.playerId];
-
-  var btn     = document.getElementById('btn-new-round');
-  var display = document.getElementById('round-votes-display');
-
+  var btn    = document.getElementById('btn-new-round');
   btn.disabled = iVoted;
   btn.classList.toggle('voted', iVoted);
-  display.textContent = count > 0 ? count + '/' + total : '';
-  document.getElementById('round-hint-text').textContent =
-    iVoted
-      ? 'Esperando al resto… (' + count + '/' + total + ')'
-      : 'Todos deben pulsar para iniciar nueva ronda';
+  document.getElementById('round-votes-display').textContent = count > 0 ? count + '/' + total : '';
+  document.getElementById('round-hint-text').textContent = iVoted
+    ? 'Esperando al resto… (' + count + '/' + total + ')'
+    : 'Todos deben pulsar para iniciar nueva ronda';
 }
 
 /* ── SALIR ──────────────────────────────────────────────────── */
 function leaveRoom() {
-  window.removeEventListener('storage', onStorageChange);
-
   if (myState.roomCode && myState.playerId) {
     if (myState.isHost) {
       deleteRoom(myState.roomCode);
     } else {
-      var room = readRoom(myState.roomCode);
-      if (room) {
-        delete room.players[myState.playerId];
-        writeRoom(myState.roomCode, room);
-      }
+      readRoom(myState.roomCode).then(function(room) {
+        if (room) {
+          delete room.players[myState.playerId];
+          writeRoom(myState.roomCode, room);
+        }
+      });
     }
   }
-
-  closeBroadcastChannel();
+  closeRealtime();
   myState = { roomCode: null, playerId: null, playerName: null, isHost: false, gameMode: 'category', category: 'actors' };
   showScreen('screen-home');
   showToast('👋 Has salido de la sala');
 }
 
 /* ══════════════════════════════════════════════════════════════
+   DETECTAR MODO LIBRE AL ESCRIBIR CÓDIGO EN "UNIRSE"
+   ══════════════════════════════════════════════════════════════ */
+var _joinCodeTimer;
+document.getElementById('join-code').addEventListener('input', function(e) {
+  var code = e.target.value.trim().toUpperCase();
+  document.getElementById('join-free-image-input').classList.add('hidden');
+  clearTimeout(_joinCodeTimer);
+  if (code.length !== 6) return;
+  _joinCodeTimer = setTimeout(function() {
+    readRoom(code).then(function(room) {
+      document.getElementById('join-free-image-input')
+        .classList.toggle('hidden', !room || room.mode !== 'free');
+    });
+  }, 400);
+});
+
+/* ══════════════════════════════════════════════════════════════
    LISTENERS DE INTERFAZ
    ══════════════════════════════════════════════════════════════ */
-
 document.getElementById('btn-create-room').addEventListener('click', function() { showScreen('screen-create'); });
 document.getElementById('btn-join-room').addEventListener('click', function() { showScreen('screen-join'); });
 
@@ -691,24 +649,12 @@ document.querySelectorAll('.pill').forEach(function(pill) {
 });
 
 document.getElementById('btn-confirm-create').addEventListener('click', createRoom);
-
-document.getElementById('join-code').addEventListener('input', function(e) {
-  var code = e.target.value.trim().toUpperCase();
-  if (code.length !== 6) {
-    document.getElementById('join-free-image-input').classList.add('hidden'); return;
-  }
-  var room = readRoom(code);
-  document.getElementById('join-free-image-input').classList.toggle('hidden', !room || room.mode !== 'free');
-});
-
 document.getElementById('btn-confirm-join').addEventListener('click', joinRoom);
 
 document.getElementById('btn-copy-code').addEventListener('click', function() {
   if (navigator.clipboard) {
     navigator.clipboard.writeText(myState.roomCode || '').then(function() { showToast('📋 Código copiado'); });
-  } else {
-    showToast('Código: ' + myState.roomCode);
-  }
+  } else { showToast('Código: ' + myState.roomCode); }
 });
 
 document.getElementById('btn-start-game').addEventListener('click', hostStartGame);
@@ -719,38 +665,30 @@ document.getElementById('btn-new-round').addEventListener('click', voteNewRound)
 document.getElementById('lightbox').addEventListener('click', function(e) {
   if (e.target === this || e.target.id === 'lightbox-close') closeLightbox();
 });
-document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') closeLightbox();
-});
+document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeLightbox(); });
 
-/* ── File inputs para Modo Libre ─────────────────────────────── */
+/* ── File inputs Modo Libre ──────────────────────────────────── */
 function setupFileInput(fileInputId, urlInputId, previewId, storeKey) {
   var fileInput = document.getElementById(fileInputId);
   var urlInput  = document.getElementById(urlInputId);
   var preview   = document.getElementById(previewId);
   if (!fileInput) return;
-
   fileInput.addEventListener('change', function() {
     var file = fileInput.files[0];
     if (!file) return;
     var reader = new FileReader();
     reader.onload = function(e) {
       window[storeKey] = e.target.result;
-      if (preview) {
-        preview.src = e.target.result;
-        preview.classList.remove('hidden');
-      }
+      if (preview) { preview.src = e.target.result; preview.classList.remove('hidden'); }
       if (urlInput) urlInput.value = '';
       showToast('✅ Imagen cargada');
     };
     reader.readAsDataURL(file);
   });
-
   if (urlInput) {
     urlInput.addEventListener('input', function() {
       if (urlInput.value.trim()) {
-        window[storeKey] = null;
-        fileInput.value = '';
+        window[storeKey] = null; fileInput.value = '';
         if (preview) preview.classList.add('hidden');
       }
     });
