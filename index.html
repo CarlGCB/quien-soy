@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>¿Quién Soy? — Who Am I?</title>
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- Firebase se añadirá aquí cuando se suba a GitHub Pages -->
+</head>
+<body>
+
+  <!-- ══════════════════════════════════
+       PANTALLA 1 — INICIO
+       ══════════════════════════════════ -->
+  <div id="screen-home" class="screen active">
+    <div class="home-bg-grid"></div>
+    <div class="home-content">
+      <div class="logo-wrap">
+        <span class="logo-tag">¿</span>
+        <h1 class="logo-title">QUIÉN<br>SOY<span class="logo-dot">?</span></h1>
+        <span class="logo-sub">WHO AM I</span>
+      </div>
+      <div class="home-buttons">
+        <button class="btn btn-create" id="btn-create-room">
+          <span class="btn-icon">✦</span> Crear Sala
+        </button>
+        <button class="btn btn-join" id="btn-join-room">
+          <span class="btn-icon">⬡</span> Unirse a Sala
+        </button>
+      </div>
+    </div>
+    <div class="scanlines"></div>
+  </div>
+
+  <!-- ══════════════════════════════════
+       PANTALLA 2 — CREAR SALA
+       ══════════════════════════════════ -->
+  <div id="screen-create" class="screen">
+    <button class="btn-back" data-target="screen-home">← Volver</button>
+    <h2 class="screen-title">Nueva Sala</h2>
+
+    <div class="form-group">
+      <label>Tu nombre</label>
+      <input type="text" id="create-name" maxlength="16" placeholder="Ej: Ana" />
+    </div>
+
+    <div class="form-group">
+      <label>Modo de juego</label>
+      <div class="mode-selector">
+        <button class="mode-btn active" data-mode="category">Categorías</button>
+        <button class="mode-btn" data-mode="free">Modo Libre</button>
+      </div>
+    </div>
+
+    <!-- Solo visible en modo Categorías -->
+    <div class="form-group" id="category-selector">
+      <label>Categoría</label>
+      <div class="category-pills">
+        <button class="pill active" data-cat="actors">🎬 Actores</button>
+        <button class="pill" data-cat="movies">🎞 Películas</button>
+        <button class="pill" data-cat="animals">🐾 Animales</button>
+      </div>
+    </div>
+
+    <!-- Solo visible en modo Libre -->
+    <div class="form-group hidden" id="free-image-input">
+      <label>Tu imagen</label>
+      <input type="url" id="create-free-url" placeholder="https://…/imagen.jpg" />
+      <div class="file-or">— o sube un archivo —</div>
+      <label class="file-label" for="create-free-file">📁 Elegir imagen del dispositivo</label>
+      <input type="file" id="create-free-file" accept="image/*" class="file-input-hidden" />
+      <img id="create-free-preview" class="img-preview hidden" alt="preview" />
+      <small>Los demás jugadores recibirán esta imagen… pero no tú.</small>
+    </div>
+
+    <button class="btn btn-create" id="btn-confirm-create">Crear Sala ✦</button>
+  </div>
+
+  <!-- ══════════════════════════════════
+       PANTALLA 3 — UNIRSE A SALA
+       ══════════════════════════════════ -->
+  <div id="screen-join" class="screen">
+    <button class="btn-back" data-target="screen-home">← Volver</button>
+    <h2 class="screen-title">Unirse a Sala</h2>
+
+    <div class="form-group">
+      <label>Tu nombre</label>
+      <input type="text" id="join-name" maxlength="16" placeholder="Ej: Mario" />
+    </div>
+
+    <div class="form-group">
+      <label>Código de Sala</label>
+      <input type="text" id="join-code" maxlength="6" placeholder="ABC123" style="text-transform:uppercase;letter-spacing:4px;" />
+    </div>
+
+    <!-- Visible si la sala está en Modo Libre -->
+    <div class="form-group hidden" id="join-free-image-input">
+      <label>Tu imagen</label>
+      <input type="url" id="join-free-url" placeholder="https://…/imagen.jpg" />
+      <div class="file-or">— o sube un archivo —</div>
+      <label class="file-label" for="join-free-file">📁 Elegir imagen del dispositivo</label>
+      <input type="file" id="join-free-file" accept="image/*" class="file-input-hidden" />
+      <img id="join-free-preview" class="img-preview hidden" alt="preview" />
+      <small>Se repartirá entre los demás jugadores, no tú.</small>
+    </div>
+
+    <button class="btn btn-join" id="btn-confirm-join">Unirse ⬡</button>
+  </div>
+
+  <!-- ══════════════════════════════════
+       PANTALLA 4 — SALA DE ESPERA
+       ══════════════════════════════════ -->
+  <div id="screen-lobby" class="screen">
+    <div class="lobby-header">
+      <div>
+        <span class="label-small">CÓDIGO DE SALA</span>
+        <div class="room-code" id="display-room-code">——</div>
+      </div>
+      <button class="btn-copy" id="btn-copy-code" title="Copiar código">📋</button>
+    </div>
+
+    <div class="players-list" id="lobby-players"></div>
+
+    <div id="lobby-waiting" class="status-msg">Esperando jugadores… (mínimo 2)</div>
+
+    <button class="btn btn-create hidden" id="btn-start-game">¡Iniciar Juego! ▶</button>
+    <button class="btn btn-leave" id="btn-leave-lobby">Salir de la sala</button>
+  </div>
+
+  <!-- ══════════════════════════════════
+       PANTALLA 5 — JUEGO
+       ══════════════════════════════════ -->
+  <div id="screen-game" class="screen">
+    <div class="game-topbar">
+      <div class="topbar-left">
+        <div class="game-room-code" id="game-room-code-display"></div>
+        <div class="game-category-badge" id="game-category-display"></div>
+      </div>
+      <div class="my-tag">
+        <span>Eres: </span><strong id="my-player-name">—</strong>
+      </div>
+      <button class="btn-leave small" id="btn-leave-game">Salir</button>
+    </div>
+
+    <!-- Arena circular de jugadores -->
+    <div class="game-arena" id="game-arena"></div>
+
+    <!-- Mi carta (imagen que veo de mí mismo) — siempre oculta -->
+    <div class="my-card-hint">
+      <span>👁 Tu imagen está sobre tu cabeza — ¡los demás la ven!</span>
+    </div>
+
+    <!-- Nueva ronda: todos deben pulsarlo -->
+    <div class="new-round-wrap">
+      <button class="btn btn-new-round-btn" id="btn-new-round">
+        🔄 Nueva Ronda
+        <span class="round-votes" id="round-votes-display"></span>
+      </button>
+      <p class="round-hint" id="round-hint-text">Todos deben pulsar para iniciar nueva ronda</p>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════
+       OVERLAY DE CARGA / ERROR
+       ══════════════════════════════════ -->
+  <div id="overlay" class="overlay hidden">
+    <div class="overlay-box">
+      <div class="spinner"></div>
+      <p id="overlay-msg">Conectando…</p>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- ══════════════════════════════════
+       LIGHTBOX — imagen ampliada
+       ══════════════════════════════════ -->
+  <div id="lightbox" class="lightbox hidden">
+    <button id="lightbox-close" class="lightbox-close">✕</button>
+    <div class="lightbox-content">
+      <img id="lightbox-img" src="" alt="" />
+      <div id="lightbox-name" class="lightbox-name"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
